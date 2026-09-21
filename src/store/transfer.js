@@ -418,6 +418,103 @@ export const useTransferStore = defineStore('transfer', {
       return { ok: true, msg: `已改派至「${to.name}」` }
     },
 
+    /* ---------- 批次拆分：按人员分组拆出未完成批次 ---------- */
+
+    // 拆分未办结批次：选中的成员带着全部登记历史移入新批次，
+    // 新批次独立安排车辆（从基地库存新占）与安置点（床位预占联动重算），
+    // 原批次保留剩余成员与车辆配置；两批各自按登记进度重新推导状态与办结条件。
+    splitBatch(batchId, { name, personIds, headcount, vehicleBaseId, vehicleCount, shelterId }) {
+      const cmd = this._cmd()
+      const src = this._batch(batchId)
+      if (!src) return { ok: false, msg: '批次不存在' }
+      if (src.status === 'closed') return { ok: false, msg: '批次已办结，不能拆分' }
+      personIds = Array.isArray(personIds) ? [...new Set(personIds)] : []
+      if (!personIds.length) return { ok: false, msg: '请勾选至少一名成员组成新分组' }
+      const move = []
+      for (const pid of personIds) {
+        const m = src.members.find((x) => x.id === pid)
+        if (!m) return { ok: false, msg: '勾选成员不属于原批次' }
+        if (m.checkoutAt) return { ok: false, msg: `「${m.name}」已转出，不能参与拆分` }
+        move.push(m)
+      }
+      const stay = src.members.filter((x) => !personIds.includes(x.id))
+      headcount = Math.max(1, Math.round(headcount || 0))
+      vehicleCount = Math.max(1, Math.round(vehicleCount || 0))
+      if (headcount < move.length) {
+        return { ok: false, msg: `新分组计划人数 ${headcount} 少于勾选成员 ${move.length} 人` }
+      }
+      // 保留在原批次的成员（含已转出）不能超过原批次剩余计划
+      if (src.headcount - headcount < stay.length) {
+        return { ok: false, msg: `原批次剩余计划 ${src.headcount - headcount} 人，容不下保留的 ${stay.length} 人，请调大新分组人数或多选成员` }
+      }
+      // 新分组车辆：从所选基地库存新占（原批次车辆维持原配置，必要时指挥员可再改派）
+      const base = cmd.bases.find((x) => x.id === vehicleBaseId)
+      if (!base) return { ok: false, msg: '请选择车辆来源' }
+      if ((base.stock.vehicle || 0) < vehicleCount) {
+        return { ok: false, msg: `${base.name} 车辆不足（余 ${base.stock.vehicle || 0} 辆）` }
+      }
+      const shelter = this.shelters.find((s) => s.id === shelterId)
+      if (!shelter) return { ok: false, msg: '请选择安置点' }
+      // 已入住成员必须随原安置点：其床位已实际占用
+      const inHouse = move.filter((x) => x.checkinAt && !x.checkoutAt)
+      if (inHouse.length && shelterId !== src.shelterId) {
+        return { ok: false, msg: `勾选中有 ${inHouse.length} 人已入住「${this.shelters.find((s) => s.id === src.shelterId)?.name}」，不能改投其它安置点（请先转出或取消勾选）` }
+      }
+      // 换到其它安置点：按当前床位余量校验新分组预占（本分组在目标点尚无预占）
+      if (shelterId !== src.shelterId && this.bedMap[shelterId].left < headcount) {
+        return { ok: false, msg: `${shelter.name} 剩余床位 ${this.bedMap[shelterId].left}，不足 ${headcount} 人，请减少人数或更换安置点` }
+      }
+
+      /* --- 校验通过，执行拆分（床位预占按 headcount 归属重算，getter 自动联动） --- */
+      const moveIds = new Set(personIds)
+      src.members = src.members.filter((x) => !moveIds.has(x.id))
+      src.headcount -= headcount
+
+      const nb = {
+        id: 'tb-' + Date.now() + '-' + ++batchSeq,
+        eventId: src.eventId,
+        name: name?.trim() || `${src.name}-拆${this.batches.filter((b) => b.eventId === src.eventId).length + 1}`,
+        headcount,
+        vehicleBaseId, vehicleCount,
+        shelterId,
+        vehicleReleased: false,
+        status: 'pending',
+        members: move,           // 登记历史（接运/入住/转出时间戳）原样保留
+        createdAt: nowStr(),
+        splitFrom: src.id,       // 拆分溯源
+        // 新分组走全新路线，重新接受阻断评估
+        held: false, holdBy: null, via: [], detourBy: null, eta: null
+      }
+      base.stock.vehicle -= vehicleCount
+      this.batches.unshift(nb)
+
+      // 同步两批的办结条件：按各自登记进度重新推导状态
+      this._recomputeStatus(src)
+      this._recomputeStatus(nb)
+      this._syncEta(nb)
+
+      const srcShelterName = this.shelters.find((s) => s.id === src.shelterId)?.name
+      this._log(src.eventId, `✂️ 批次「${src.name}」按人员分组拆分出「${nb.name}」：${move.length} 人（${base.name} 出车 ${vehicleCount} 辆 → ${shelter.name}）；原批次剩 ${src.headcount} 人继续 → ${srcShelterName}`)
+
+      // 联动：新分组路线立即接受生效阻断复核（绕行/改派/挂起）
+      try { useRoadblockStore().assessActive() } catch { /* 道路阻断模块未初始化 */ }
+      return { ok: true, batch: nb, source: src }
+    },
+
+    // 按现有登记进度推导批次状态（拆分后同步办结条件）：
+    // 无接运 → 待接运；未全部入住 → 接运中；全部入住 → 已安置；
+    // 已安置且在册人员全部转出 → 自动办结并回收车辆（满员批次的自动办结规则）
+    _recomputeStatus(b) {
+      const picked = b.members.filter((x) => x.pickupAt).length
+      const checkedIn = b.members.filter((x) => x.checkinAt).length
+      if (picked === 0) b.status = 'pending'
+      else if (checkedIn < picked || picked < b.headcount) b.status = 'transporting'
+      else b.status = 'settled'
+      if (b.status === 'settled' && b.members.length > 0 && b.members.every((x) => x.checkoutAt)) {
+        this._close(b)
+      }
+    },
+
     /* ---------- 安置点物资联动 ---------- */
 
     // 一键补给：按缺口就近调拨（预占式演算，直接生成补给派发记录）

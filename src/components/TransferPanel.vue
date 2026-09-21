@@ -99,6 +99,7 @@
           <div class="bc-actions" v-if="b.status !== 'closed'">
             <button :disabled="b.held" @click="toggle(b.id, 'reg')">📝 登记</button>
             <button @click="toggle(b.id, 're')">🔀 改派</button>
+            <button class="split" @click="toggle(b.id, 'split')">✂️ 拆分</button>
             <button class="ok" @click="onClose(b)">✅ 办结</button>
             <button v-if="!b.members.length" class="danger" @click="onCancel(b)">🗑 取消</button>
           </div>
@@ -172,6 +173,82 @@
             <p v-if="fb[b.id]" class="msg" :class="fb[b.id].ok ? 'ok' : 'err'">{{ fb[b.id].msg }}</p>
             <button class="primary wide" @click="onReassign(b)">确认改派</button>
           </div>
+
+          <!-- 拆分面板：勾选成员组成新分组，独立安排车辆与安置点 -->
+          <div v-if="openId === b.id && openMode === 'split'" class="reg-panel">
+            <p class="reg-hint">
+              ✂️ 勾选成员拆为新批次：登记历史（接运/入住/转出记录）随人保留，
+              新批次独立分配车辆与安置点，床位预占、运输路线与事件转移进度自动联动
+            </p>
+            <div class="field">
+              <label>新批次名称</label>
+              <input v-model="spForm.name" :placeholder="`${b.name}-拆${eventBatches.length + 1}`" />
+            </div>
+            <div class="field">
+              <label>
+                勾选拆出成员（在途 {{ splitMovable(b).picked }} 人 · 在住 {{ splitMovable(b).inHouse }} 人可选
+                <template v-if="splitMovable(b).out">；已转出 {{ splitMovable(b).out }} 人不参与拆分</template>）
+              </label>
+              <div class="split-members">
+                <label v-for="m in splitMovable(b).list" :key="m.id" class="sm-item" :class="{ out: m.checkoutAt }">
+                  <input
+                    type="checkbox"
+                    :value="m.id"
+                    v-model="spForm.personIds"
+                    :disabled="!!m.checkoutAt"
+                  />
+                  <span class="m-name">{{ m.name }}<em v-if="m.idNo"> · {{ m.idNo }}</em></span>
+                  <span class="m-flags">
+                    <i class="on" v-if="m.pickupAt">接</i>
+                    <i class="on" v-if="m.checkinAt">住</i>
+                    <i class="on" v-if="m.checkoutAt">转</i>
+                  </span>
+                </label>
+              </div>
+            </div>
+            <div class="field">
+              <label>已选 {{ spForm.personIds.length }} 人 · 在住 {{ splitInHouseCount(b) }} 人</label>
+            </div>
+            <div class="grid2">
+              <div class="field">
+                <label>新分组计划人数</label>
+                <input type="number" min="1" v-model.number="spForm.headcount" />
+              </div>
+              <div class="field">
+                <label>车辆数（约40人/辆）</label>
+                <input type="number" min="1" v-model.number="spForm.vehicleCount" />
+              </div>
+            </div>
+            <div class="field">
+              <label>新分组车辆来源（占用车辆库存，原批次车辆保留）</label>
+              <select v-model="spForm.vehicleBaseId">
+                <option v-for="x in cmd.bases" :key="x.id" :value="x.id" :disabled="(x.stock.vehicle || 0) === 0">
+                  {{ x.name }}（余 {{ x.stock.vehicle || 0 }} 辆）
+                </option>
+              </select>
+            </div>
+            <div class="field">
+              <label>
+                新分组安置点
+                <template v-if="splitInHouseCount(b) > 0">（含已入住成员，锁定原安置点）</template>
+              </label>
+              <select v-model="spForm.shelterId" :disabled="splitInHouseCount(b) > 0">
+                <option v-for="s in transfer.shelters" :key="s.id" :value="s.id">
+                  {{ s.name }}（余 {{ bedOf(s.id).left }}/{{ s.capacity }}）
+                </option>
+              </select>
+            </div>
+            <p class="cf-eta" v-if="splitEta(b)">
+              🚚 新分组路线约 {{ splitEta(b).distance }}km · {{ splitEta(b).minutes }}min
+            </p>
+            <p class="split-preview">
+              拆分后原批次：计划 <b>{{ b.headcount - (spForm.headcount || 0) }}</b> 人
+              · 保留成员 <b>{{ b.members.length - spForm.personIds.length }}</b> 人
+              · 车辆/路线保持现状，剩余人员继续登记
+            </p>
+            <p v-if="fb[b.id]" class="msg" :class="fb[b.id].ok ? 'ok' : 'err'">{{ fb[b.id].msg }}</p>
+            <button class="primary wide" @click="onSplit(b)">✂️ 确认拆分（分别安排车辆与安置点）</button>
+          </div>
         </div>
       </template>
     </template>
@@ -239,6 +316,7 @@ const supplyMsg = reactive({})
 
 const form = ref({ name: '', headcount: 100, vehicleBaseId: '', vehicleCount: 3, shelterId: '' })
 const reForm = ref({ shelterId: '', vehicleBaseId: '', vehicleCount: 1 })
+const spForm = ref({ name: '', personIds: [], headcount: 1, vehicleBaseId: '', vehicleCount: 1, shelterId: '' })
 
 const selectedEvent = computed(() => cmd.events.find((e) => e.id === cmd.selectedEventId) || null)
 const eventBatches = computed(() =>
@@ -330,7 +408,71 @@ function toggle(id, mode) {
   if (mode === 're') {
     const b = transfer.batches.find((x) => x.id === id)
     reForm.value = { shelterId: b.shelterId, vehicleBaseId: b.vehicleBaseId, vehicleCount: b.vehicleCount }
+  } else if (mode === 'split') {
+    initSplitForm(transfer.batches.find((x) => x.id === id))
   }
+}
+
+/* ---------- 批次拆分 ---------- */
+function splitMovable(b) {
+  const list = b.members
+  return {
+    list,
+    picked: list.filter((m) => m.pickupAt && !m.checkinAt && !m.checkoutAt).length,
+    inHouse: list.filter((m) => m.checkinAt && !m.checkoutAt).length,
+    out: list.filter((m) => m.checkoutAt).length
+  }
+}
+function splitInHouseCount(b) {
+  return b.members.filter((m) => m.checkinAt && !m.checkoutAt && spForm.value.personIds.includes(m.id)).length
+}
+const splitEta = (b) => {
+  if (!selectedEvent.value || !spForm.value.shelterId) return null
+  const s = transfer.shelters.find((x) => x.id === spForm.value.shelterId)
+  if (!s) return null
+  return roughPath(selectedEvent.value.location.lng, selectedEvent.value.location.lat, s.lng, s.lat)
+}
+function initSplitForm(b) {
+  if (!b) return
+  // 默认车辆来源：有车且距受灾点最近
+  const ev = selectedEvent.value
+  let vb = null, bestD = Infinity
+  cmd.bases.forEach((x) => {
+    if ((x.stock.vehicle || 0) <= 0 || !ev) return
+    const d = Math.hypot(x.lng - ev.location.lng, x.lat - ev.location.lat)
+    if (d < bestD) { bestD = d; vb = x }
+  })
+  spForm.value = {
+    name: '',
+    personIds: [],
+    headcount: 1,
+    vehicleBaseId: vb?.id || cmd.bases[0]?.id || '',
+    vehicleCount: 1,
+    shelterId: b.shelterId
+  }
+}
+// 勾选人数变化：联动新分组计划人数与车辆数（不少于勾选人数）
+watch(() => spForm.value.personIds.length, (n) => {
+  if (openMode.value !== 'split' || !n) return
+  if (spForm.value.headcount < n) spForm.value.headcount = n
+  spForm.value.vehicleCount = Math.max(1, Math.ceil((spForm.value.headcount || 1) / 40))
+})
+watch(() => spForm.value.headcount, (n) => {
+  if (openMode.value === 'split') spForm.value.vehicleCount = Math.max(1, Math.ceil((n || 1) / 40))
+})
+// 勾选含已入住成员时锁定原安置点
+watch(() => spForm.value.personIds, (ids) => {
+  if (openMode.value !== 'split') return
+  const b = transfer.batches.find((x) => x.id === openId.value)
+  const hasInHouse = b?.members.some((m) => m.checkinAt && !m.checkoutAt && ids.includes(m.id))
+  if (hasInHouse && spForm.value.shelterId !== b.shelterId) spForm.value.shelterId = b.shelterId
+}, { deep: true })
+function onSplit(b) {
+  // 安置点锁定保护：含在住成员时强制原安置点
+  if (splitInHouseCount(b) > 0) spForm.value.shelterId = b.shelterId
+  const r = transfer.splitBatch(b.id, { ...spForm.value })
+  fb[b.id] = r
+  if (r.ok) openId.value = null
 }
 
 function setFb(batchId, r) {
@@ -469,7 +611,24 @@ function onSupply(shelterId) {
 .bc-actions button:disabled { opacity: 0.45; cursor: not-allowed; }
 .bc-actions button:disabled:hover { color: #8ba2c8; border-color: rgba(120,160,220,0.2); }
 .bc-actions .ok:hover { color: #7ef0c9; border-color: #26a69a; }
+.bc-actions .split:hover { color: #ffd54f; border-color: #ffc107; }
 .bc-actions .danger:hover { color: #ef5350; border-color: #ef5350; }
+
+/* 拆分面板 */
+.split-members {
+  max-height: 168px; overflow-y: auto; display: flex; flex-direction: column; gap: 3px;
+  border: 1px solid rgba(120,160,220,0.15); border-radius: 7px; padding: 6px;
+  background: #0c1730;
+}
+.sm-item {
+  display: flex; align-items: center; gap: 7px; font-size: 11px;
+  padding: 3px 5px; border-radius: 5px; cursor: pointer; color: #dbe4f3;
+}
+.sm-item:hover { background: #101d39; }
+.sm-item.out { opacity: 0.5; cursor: not-allowed; }
+.sm-item input[type="checkbox"] { flex-shrink: 0; accent-color: #26a69a; }
+.split-preview { font-size: 10px; color: #8ba2c8; margin: 0; padding: 6px 8px; background: rgba(255,193,7,0.08); border-radius: 6px; }
+.split-preview b { color: #ffd54f; }
 
 /* 登记 / 改派面板 */
 .reg-panel {
