@@ -272,6 +272,136 @@ export const useTransferStore = defineStore('transfer', {
       return { ok: true }
     },
 
+    /* ---------- 批次拆分：按人员分组分流 ---------- */
+
+    // 拆分未完成批次：按人员分组（已登记成员 + 未登记名额）分出子批次，
+    // 各子批次独立安排车辆与安置点；登记历史随人员整体迁移，床位/车辆/路线联动重算，
+    // 原批次计划人数同步核减，并按剩余人员重算状态与办结条件（事件转移进度总量守恒）
+    splitBatch(batchId, { keepVehicleCount, groups = [] } = {}) {
+      const cmd = this._cmd()
+      const b = this._batch(batchId)
+      if (!b || b.status === 'closed') return { ok: false, msg: '批次不存在或已办结' }
+      if (b.held) return { ok: false, msg: '批次因道路阻断挂起中，待恢复续派后再拆分' }
+      if (!Array.isArray(groups) || !groups.length) return { ok: false, msg: '请至少添加一个拆分分组' }
+
+      // 原批次保留车辆数（缺省不调整；差额释放回车辆来源基地，可供子批次重新占用）
+      const keepV = keepVehicleCount == null ? b.vehicleCount : Math.max(0, Math.round(keepVehicleCount))
+      if (keepV > b.vehicleCount) return { ok: false, msg: `原批次保留车辆不能超过现有 ${b.vehicleCount} 辆` }
+
+      // 规范化分组并逐项校验（已转出人员脱离批次管理，不参与拆分）
+      const room = b.headcount - b.members.length // 未登记名额
+      const used = new Set()
+      let quotaSum = 0
+      const plans = []
+      for (let gi = 0; gi < groups.length; gi++) {
+        const g = groups[gi]
+        const shelter = this.shelters.find((s) => s.id === g.shelterId)
+        const vBase = cmd.bases.find((x) => x.id === g.vehicleBaseId)
+        const vehicleCount = Math.max(1, Math.round(g.vehicleCount || 0))
+        const quota = Math.max(0, Math.round(g.quota || 0))
+        if (!shelter || !vBase) return { ok: false, msg: `分组${gi + 1}：请检查车辆来源与安置点` }
+        const members = []
+        for (const id of [...new Set(g.memberIds || [])]) {
+          const m = b.members.find((x) => x.id === id)
+          if (!m) return { ok: false, msg: `分组${gi + 1}：人员不在原批次或已被其他分组选走` }
+          if (m.checkoutAt) return { ok: false, msg: `分组${gi + 1}：「${m.name}」已转出，不参与拆分` }
+          if (used.has(id)) return { ok: false, msg: `分组${gi + 1}：「${m.name}」被重复选择` }
+          used.add(id)
+          members.push(m)
+        }
+        quotaSum += quota
+        if (members.length + quota < 1) return { ok: false, msg: `分组${gi + 1}：分流人数至少 1 人` }
+        plans.push({ g, shelter, vBase, vehicleCount, quota, members, size: members.length + quota })
+      }
+      if (quotaSum > room) return { ok: false, msg: `未登记名额不足：剩余 ${room} 人，各分组合计需 ${quotaSum} 人` }
+
+      // 床位预检：跨安置点分流累计需求（同安置点分流不改变该点床位占用，无需校验）
+      const bedNeed = {}
+      plans.forEach((p) => {
+        if (p.shelter.id !== b.shelterId) bedNeed[p.shelter.id] = (bedNeed[p.shelter.id] || 0) + p.size
+      })
+      for (const [sid, n] of Object.entries(bedNeed)) {
+        const left = this.bedMap[sid]?.left || 0
+        if (left < n) {
+          return { ok: false, msg: `${this.shelters.find((s) => s.id === sid)?.name} 剩余床位 ${left}，不足分流 ${n} 人，请调整分组或更换安置点` }
+        }
+      }
+      // 车辆预检：原批次释放回补后，各基地累计占用不超库存
+      const vehAvail = {}
+      cmd.bases.forEach((x) => { vehAvail[x.id] = x.stock.vehicle || 0 })
+      if (!b.vehicleReleased && keepV < b.vehicleCount) vehAvail[b.vehicleBaseId] += b.vehicleCount - keepV
+      for (const p of plans) {
+        if ((vehAvail[p.vBase.id] || 0) < p.vehicleCount) {
+          return { ok: false, msg: `${p.vBase.name} 车辆不足（含原批次释放可调 ${vehAvail[p.vBase.id] || 0} 辆，该分组需 ${p.vehicleCount} 辆）` }
+        }
+        vehAvail[p.vBase.id] -= p.vehicleCount
+      }
+
+      // —— 执行：先释放原批次车辆差额，再逐组落库 ——
+      if (!b.vehicleReleased && keepV < b.vehicleCount) {
+        const ob = cmd.bases.find((x) => x.id === b.vehicleBaseId)
+        if (ob) ob.stock.vehicle += b.vehicleCount - keepV
+        this._log(b.eventId, `🚒 批次「${b.name}」车辆拆分联动：${b.vehicleCount}→${keepV} 辆，释放 ${b.vehicleCount - keepV} 辆回 ${ob?.name}`)
+        b.vehicleCount = keepV
+      }
+      const created = []
+      plans.forEach((p, i) => {
+        p.vBase.stock.vehicle -= p.vehicleCount // 占用子批次车辆
+        const ids = new Set(p.members.map((m) => m.id))
+        b.members = b.members.filter((x) => !ids.has(x.id))
+        const nb = {
+          id: 'tb-' + Date.now() + '-' + ++batchSeq,
+          eventId: b.eventId,
+          name: p.g.name?.trim() || `${b.name}·分流${i + 1}`,
+          headcount: p.size,
+          vehicleBaseId: p.vBase.id, vehicleCount: p.vehicleCount,
+          shelterId: p.shelter.id,
+          vehicleReleased: false,
+          status: 'pending',
+          members: p.members, // 登记历史（接运/入住时间）随人员整体迁移
+          createdAt: nowStr(),
+          held: false, holdBy: null, via: [], detourBy: null, eta: null,
+          splitFrom: { id: b.id, name: b.name }
+        }
+        // 状态随迁入人员进度推导：全员已入住且无未登记名额 → 已安置
+        if (nb.members.length) {
+          nb.status = (p.quota === 0 && nb.members.every((x) => x.checkinAt)) ? 'settled' : 'transporting'
+        }
+        this._syncEta(nb)
+        this.batches.unshift(nb)
+        created.push(nb)
+        b.headcount -= p.size // 原批次计划人数同步核减
+        b.splitLogs = b.splitLogs || []
+        b.splitLogs.push({ at: nowStr(), toBatchId: nb.id, toName: nb.name, members: p.members.length, quota: p.quota })
+        this._log(b.eventId, `✂️ 批次拆分：「${b.name}」分出 ${p.size} 人（已登记 ${p.members.length}${p.quota ? `＋未登记名额 ${p.quota}` : ''}）→「${nb.name}」：${p.vBase.name} 出车 ${p.vehicleCount} 辆 → ${p.shelter.name}`)
+      })
+      // 原批次办结条件同步：按计划核减后的剩余人员重算状态，空置/全员转出自动办结
+      this._syncAfterSplit(b)
+      // 联动：子批次立即接受生效阻断复核（路线/ETA 由响应式同步地图）
+      try { useRoadblockStore().assessActive() } catch { /* 道路阻断模块未初始化 */ }
+      return { ok: true, created, remainder: b, msg: `已拆分出 ${created.length} 个分流批次` }
+    },
+
+    // 拆分后原批次状态重算：人员清空则办结或回到待接运；剩余人员满足安置/转出条件则推进
+    _syncAfterSplit(b) {
+      if (b.status === 'closed') return
+      const inDone = b.members.filter((x) => x.checkinAt).length
+      const out = b.members.filter((x) => x.checkoutAt).length
+      if (b.members.length === 0) {
+        if (b.headcount === 0) {
+          b.status = 'closed'
+          this._releaseVehicles(b)
+          this._log(b.eventId, `✂️ 批次「${b.name}」人员已全量拆分，车辆回收办结`)
+        } else {
+          b.status = 'pending' // 仅剩未登记名额，回到待接运
+        }
+        return
+      }
+      if (b.status === 'pending' && b.members.some((x) => x.pickupAt)) b.status = 'transporting'
+      if (b.status === 'transporting' && inDone >= b.headcount) b.status = 'settled'
+      if (b.status === 'settled' && out === b.members.length) this._close(b)
+    },
+
     /* ---------- 现场登记：接运 / 入住 / 转出 ---------- */
 
     // 单人登记（带查重）；批量登记传 { count }

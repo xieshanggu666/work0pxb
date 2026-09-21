@@ -94,11 +94,18 @@
             <template v-if="b.eta">
               <br />🚚 约 {{ b.eta.distance }}km · {{ b.eta.minutes }}min{{ b.via && b.via.length ? '（绕行中）' : '' }}
             </template>
+            <template v-if="b.splitFrom">
+              <br />✂️ 由「{{ b.splitFrom.name }}」拆分汇入
+            </template>
+            <template v-if="b.splitLogs && b.splitLogs.length">
+              <br />✂️ 已分流 {{ b.splitLogs.length }} 批（{{ b.splitLogs.reduce((s, x) => s + x.members + x.quota, 0) }} 人）
+            </template>
           </p>
           <p v-if="b.held" class="bc-held-hint">道路阻断挂起中：接运/入住登记暂停，恢复通行后可在「道路阻断」页签续派</p>
           <div class="bc-actions" v-if="b.status !== 'closed'">
             <button :disabled="b.held" @click="toggle(b.id, 'reg')">📝 登记</button>
             <button @click="toggle(b.id, 're')">🔀 改派</button>
+            <button :disabled="!canSplit(b)" @click="toggle(b.id, 'split')">✂️ 拆分</button>
             <button class="ok" @click="onClose(b)">✅ 办结</button>
             <button v-if="!b.members.length" class="danger" @click="onCancel(b)">🗑 取消</button>
           </div>
@@ -172,6 +179,65 @@
             <p v-if="fb[b.id]" class="msg" :class="fb[b.id].ok ? 'ok' : 'err'">{{ fb[b.id].msg }}</p>
             <button class="primary wide" @click="onReassign(b)">确认改派</button>
           </div>
+
+          <!-- 拆分面板 -->
+          <div v-if="openId === b.id && openMode === 'split'" class="reg-panel">
+            <p class="reg-hint">
+              可分流：未入住 {{ splitPool(b, 'pending').length }} · 在住 {{ splitPool(b, 'housed').length }}
+              · 未登记名额 {{ b.headcount - b.members.length }}（已转出不参与；登记历史随人员迁移）
+            </p>
+            <div v-for="(g, gi) in splitForm.groups" :key="gi" class="split-group">
+              <div class="sg-head">
+                <span>分组 {{ gi + 1 }} →「{{ g.name || `${b.name}·分流${gi + 1}` }}」</span>
+                <button v-if="splitForm.groups.length > 1" class="sg-del" @click="splitForm.groups.splice(gi, 1)">✕</button>
+              </div>
+              <div class="grid2">
+                <div class="field">
+                  <label>人员分组</label>
+                  <select v-model="g.source" @change="onSplitSource(b, gi)">
+                    <option value="pending">已接运未入住</option>
+                    <option value="housed">在住人员</option>
+                    <option value="quota">未登记名额</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label>人数（≤ {{ splitMax(b, gi) }}）</label>
+                  <input type="number" min="1" :max="splitMax(b, gi)" v-model.number="g.count" />
+                </div>
+              </div>
+              <div class="field">
+                <label>批次名称</label>
+                <input v-model="g.name" :placeholder="`${b.name}·分流${gi + 1}`" />
+              </div>
+              <div class="field">
+                <label>安置点（剩余床位 / 容量）</label>
+                <select v-model="g.shelterId">
+                  <option v-for="s in transfer.shelters" :key="s.id" :value="s.id">
+                    {{ s.name }}（余 {{ bedOf(s.id).left }}/{{ s.capacity }}）
+                  </option>
+                </select>
+              </div>
+              <div class="grid2">
+                <div class="field">
+                  <label>车辆来源</label>
+                  <select v-model="g.vehicleBaseId">
+                    <option v-for="x in cmd.bases" :key="x.id" :value="x.id">{{ x.name }}（余 {{ x.stock.vehicle || 0 }}）</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label>车辆数</label>
+                  <input type="number" min="1" v-model.number="g.vehicleCount" />
+                </div>
+              </div>
+            </div>
+            <button class="ghost wide-add" @click="addSplitGroup(b)">＋ 添加分组</button>
+            <div class="field">
+              <label>原批次保留车辆（释放 {{ Math.max(0, b.vehicleCount - splitForm.keepVehicles) }} 辆回 {{ baseName(b.vehicleBaseId) }}）</label>
+              <input type="number" min="0" :max="b.vehicleCount" v-model.number="splitForm.keepVehicles" />
+            </div>
+            <p v-if="fb[b.id]" class="msg" :class="fb[b.id].ok ? 'ok' : 'err'">{{ fb[b.id].msg }}</p>
+            <button class="primary wide" @click="onSplit(b)">✂️ 确认拆分</button>
+          </div>
         </div>
       </template>
     </template>
@@ -239,6 +305,7 @@ const supplyMsg = reactive({})
 
 const form = ref({ name: '', headcount: 100, vehicleBaseId: '', vehicleCount: 3, shelterId: '' })
 const reForm = ref({ shelterId: '', vehicleBaseId: '', vehicleCount: 1 })
+const splitForm = ref({ keepVehicles: 0, groups: [] }) // 拆分表单：原批次保留车辆 + 各分流分组
 
 const selectedEvent = computed(() => cmd.events.find((e) => e.id === cmd.selectedEventId) || null)
 const eventBatches = computed(() =>
@@ -267,7 +334,27 @@ const resLabel = (k) => RESOURCE_TYPES[k]?.label || k
 const resIcon = (k) => RESOURCE_TYPES[k]?.icon || ''
 const resUnit = (k) => RESOURCE_TYPES[k]?.unit || ''
 const countOf = (b, key) => b.members.filter((x) => x[key]).length
-const pct = (b, key) => Math.min(100, Math.round((countOf(b, key) / b.headcount) * 100)) + '%'
+const pct = (b, key) => {
+  if (!b.headcount) return '0%'
+  return Math.min(100, Math.round((countOf(b, key) / b.headcount) * 100)) + '%'
+}
+// 拆分：可分流人员池（已转出人员不参与）
+const splitPool = (b, source) => {
+  if (source === 'pending') return b.members.filter((x) => x.pickupAt && !x.checkinAt)
+  if (source === 'housed') return b.members.filter((x) => x.checkinAt && !x.checkoutAt)
+  return [] // quota：未登记名额（计划余量）
+}
+// 某分组当前来源还可选人数（扣除其他分组已占用的同源人数）
+const splitMax = (b, idx) => {
+  const g = splitForm.value.groups[idx]
+  if (!g) return 0
+  const others = splitForm.value.groups.reduce((s, x, i) => (i !== idx && x.source === g.source ? s + (x.count || 0) : s), 0)
+  const total = g.source === 'quota' ? b.headcount - b.members.length : splitPool(b, g.source).length
+  return Math.max(0, total - others)
+}
+const canSplit = (b) =>
+  b.status !== 'closed' && !b.held &&
+  (b.members.some((x) => !x.checkoutAt) || b.headcount > b.members.length)
 const reservedStyle = (s) => {
   const bed = bedOf(s.id)
   const inPct = (bed.inHouse / s.capacity) * 100
@@ -331,6 +418,51 @@ function toggle(id, mode) {
     const b = transfer.batches.find((x) => x.id === id)
     reForm.value = { shelterId: b.shelterId, vehicleBaseId: b.vehicleBaseId, vehicleCount: b.vehicleCount }
   }
+  if (mode === 'split') {
+    const b = transfer.batches.find((x) => x.id === id)
+    splitForm.value = { keepVehicles: b.vehicleCount, groups: [] }
+    addSplitGroup(b)
+  }
+}
+
+// 拆分分组：新增（默认取有余量的来源，人数拉满，车辆按 40 人/辆建议）
+function addSplitGroup(b) {
+  const src = splitPool(b, 'pending').length ? 'pending'
+    : splitPool(b, 'housed').length ? 'housed' : 'quota'
+  splitForm.value.groups.push({
+    name: '', source: src, count: 0,
+    shelterId: b.shelterId, vehicleBaseId: b.vehicleBaseId, vehicleCount: 1
+  })
+  const idx = splitForm.value.groups.length - 1
+  const g = splitForm.value.groups[idx]
+  g.count = Math.max(1, splitMax(b, idx))
+  g.vehicleCount = Math.max(1, Math.ceil(g.count / 40))
+}
+// 来源切换：人数重置为该来源余量并联动建议车辆数
+function onSplitSource(b, gi) {
+  const g = splitForm.value.groups[gi]
+  g.count = Math.max(1, splitMax(b, gi))
+  g.vehicleCount = Math.max(1, Math.ceil(g.count / 40))
+}
+// 确认拆分：按分组来源顺序解析人员（同来源分组依次取人，避免重叠）
+function onSplit(b) {
+  const offsets = { pending: 0, housed: 0 }
+  const groups = splitForm.value.groups.map((g) => {
+    let memberIds = []
+    if (g.source !== 'quota') {
+      const pool = splitPool(b, g.source)
+      memberIds = pool.slice(offsets[g.source], offsets[g.source] + (g.count || 0)).map((x) => x.id)
+      offsets[g.source] += g.count || 0
+    }
+    return {
+      name: g.name, memberIds,
+      quota: g.source === 'quota' ? g.count : 0,
+      shelterId: g.shelterId, vehicleBaseId: g.vehicleBaseId, vehicleCount: g.vehicleCount
+    }
+  })
+  const r = transfer.splitBatch(b.id, { keepVehicleCount: splitForm.value.keepVehicles, groups })
+  fb[b.id] = r.ok ? { ok: true, msg: r.msg } : r
+  if (r.ok) openId.value = null
 }
 
 function setFb(batchId, r) {
@@ -494,6 +626,24 @@ function onSupply(shelterId) {
   background: rgba(255,193,7,0.1); color: #ffc107; font-size: 11px; cursor: pointer;
 }
 .move-btn:hover { background: rgba(255,193,7,0.2); }
+
+/* 拆分面板 */
+.split-group {
+  background: #0c1730; border: 1px solid rgba(120,160,220,0.15);
+  border-radius: 8px; padding: 8px;
+}
+.split-group .field:last-child { margin-bottom: 0; }
+.sg-head {
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 11px; color: #7ef0c9; font-weight: 600; margin-bottom: 7px;
+}
+.sg-head span { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sg-del {
+  flex-shrink: 0; background: transparent; border: none; color: #5b6f94;
+  font-size: 11px; cursor: pointer; padding: 0 2px;
+}
+.sg-del:hover { color: #ef5350; }
+.wide-add { width: 100%; padding: 6px; border-style: dashed; }
 
 /* 登记明细 */
 .member-list { display: flex; flex-direction: column; gap: 4px; }
